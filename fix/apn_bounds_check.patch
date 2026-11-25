@@ -1,0 +1,44 @@
+# APN IE decoder: bounds-check reads against delivered length
+#
+# The core change. `liblte_mme_unpack_access_point_name_ie()` currently reads
+# `(*ie_ptr)[0]` as a length and then reads that many payload bytes, without any
+# knowledge of how many bytes were actually delivered in the NAS message. This
+# patch threads the available length (derived from the message's own `N_bytes`)
+# down to the decoder and checks every read against it.
+#
+# Line numbers are approximate against srsRAN_4G lib/src/asn1/liblte_mme.cc.
+# This is the essential change, not a drop-in merge patch, because the real fix
+# also touches the public header prototype and each caller's call site.
+
+--- a/lib/src/asn1/liblte_mme.cc
++++ b/lib/src/asn1/liblte_mme.cc
+@@ -3369,7 +3369,8 @@
+-LIBLTE_ERROR_ENUM liblte_mme_unpack_access_point_name_ie(uint8 **ie_ptr,
+-                                                         LIBLTE_MME_ACCESS_POINT_NAME_STRUCT *apn)
++LIBLTE_ERROR_ENUM liblte_mme_unpack_access_point_name_ie(uint8 **ie_ptr,
++                                                         uint32 avail,   /* bytes actually available */
++                                                         LIBLTE_MME_ACCESS_POINT_NAME_STRUCT *apn)
+ {
+     LIBLTE_ERROR_ENUM err = LIBLTE_ERROR_INVALID_INPUTS;
+     uint32            ie_idx;
+@@ -3378,10 +3379,12 @@
+     if (ie_ptr != NULL && apn != NULL) {
+         ie_idx  = 0;
+         str_cnt = 0;
+         while (ie_idx < (*ie_ptr)[0] && str_cnt < LIBLTE_STRING_LEN) {
++            if ((uint32)(1 + ie_idx) >= avail) break;                 /* FIX: stop at end of delivered data */
+             label_len = (*ie_ptr)[1 + ie_idx];
+             for (i = 0; i < label_len && str_cnt < LIBLTE_STRING_LEN; i++) {
++                if ((uint32)(1 + ie_idx + i + 1) >= avail) break;     /* FIX: never read past delivered data */
+                 apn->apn[str_cnt] = (char)((*ie_ptr)[1 + ie_idx + i + 1]);
+                 str_cnt++;
+             }
+             ie_idx += label_len + 1;
+
+# And at the caller (liblte_mme_unpack_activate_default_eps_bearer_context_request_msg,
+# ~line 8429), pass the number of bytes remaining in the message instead of nothing:
+#
+#   - liblte_mme_unpack_access_point_name_ie(&msg_ptr, &act_def_eps_bearer_context_req->apn);
+#   + uint32 remaining = msg->N_bytes - (msg_ptr - msg->msg);
+#   + liblte_mme_unpack_access_point_name_ie(&msg_ptr, remaining,
+#   +                                        &act_def_eps_bearer_context_req->apn);
